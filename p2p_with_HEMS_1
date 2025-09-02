@@ -1,0 +1,348 @@
+import hashlib
+import time
+import random
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+from collections import defaultdict
+import numpy as np
+from scipy.optimize import linprog
+import json
+
+# --- Blockchain structure ---
+class Block:
+    def __init__(self, index, transactions, timestamp, previous_hash):
+        self.index = index
+        self.transactions = transactions
+        self.timestamp = timestamp
+        self.previous_hash = previous_hash
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self):
+        block_string = json.dumps({
+            "transactions": self.transactions, "timestamp": self.timestamp,
+            "previous_hash": self.previous_hash
+        }, sort_keys=True)
+        return hashlib.sha256(block_string.encode()).hexdigest()
+
+class Blockchain:
+    def __init__(self):
+        self.chain = [self.create_genesis_block()]
+        self.transaction_log = set()
+    def create_genesis_block(self):
+        return Block(0, [], time.time(), "0")
+    def _verify_transaction(self, tx):
+        tx_id = f"{tx['from']}->{tx['to']}@{tx['energy_kWh']}"
+        if tx_id in self.transaction_log: return False
+        if tx['energy_kWh'] <= 0: return False
+        return True
+    def add_block(self, transactions):
+        filtered_txs = []
+        for tx in transactions:
+            if self._verify_transaction(tx):
+                tx_id = f"{tx['from']}->{tx['to']}@{tx['energy_kWh']}"
+                self.transaction_log.add(tx_id)
+                filtered_txs.append(tx)
+        if not filtered_txs: return None
+        latest = self.chain[-1]
+        new_block = Block(len(self.chain), filtered_txs, time.time(), latest.hash)
+        self.chain.append(new_block)
+        return new_block
+
+class SimpleBlockchain(Blockchain):
+    def add_block(self, transactions):
+        if transactions:
+            latest = self.chain[-1]
+            new_block = Block(len(self.chain), transactions, time.time(), latest.hash)
+            self.chain.append(new_block)
+            return new_block
+        return None
+
+class HashIndexedBlockchain(Blockchain):
+    def __init__(self):
+        super().__init__()
+        self.index_map = {}
+    def add_block(self, transactions):
+        filtered_txs = []
+        for tx in transactions:
+            if self._verify_transaction(tx):
+                tx_id = f"{tx['from']}->{tx['to']}@{tx['energy_kWh']}"
+                self.transaction_log.add(tx_id)
+                self.index_map[tx_id] = len(self.chain)
+                filtered_txs.append(tx)
+        if not filtered_txs: return None
+        latest = self.chain[-1]
+        new_block = Block(len(self.chain), filtered_txs, time.time(), latest.hash)
+        self.chain.append(new_block)
+        return new_block
+
+class VerifiedBlockchain(Blockchain):
+    def _verify_transaction(self, tx):
+        if not super()._verify_transaction(tx): return False
+        if tx['from'] == tx['to']: return False
+        return True
+
+# --- Participants ---
+class Participant:
+    def __init__(self, name, balance=0): self.name = name; self.balance = balance
+class Prosumer(Participant):
+    def __init__(self, name, energy_available, price_per_unit): super().__init__(name); self.energy_available = energy_available; self.price_per_unit = price_per_unit
+class Consumer(Participant):
+    def __init__(self, name, energy_required, bid_price): super().__init__(name); self.energy_required = energy_required; self.bid_price = bid_price
+
+# --- Pricing strategies ---
+def time_strategy(hour):
+    if 10 <= hour <= 14: return 5.5
+    elif 7 <= hour <= 9 or 15 <= hour <= 17: return 4.5
+    else: return 3.5
+def inventory_strategy(available):
+    if available >= 3.0: return 4.0
+    elif available >= 1.5: return 4.5
+    else: return 5.0
+def consumer_bid_strategy(strategy_type, hour, gen, load):
+    prosumer_price = time_strategy(hour) if strategy_type == 'time' else inventory_strategy(gen - load)
+    return prosumer_price + random.uniform(1.0, 2.5)
+
+# --- Main Simulation Engine ---
+def simulate_market(strategy_type, use_blockchain=True, shared_profiles=None, blockchain_class=Blockchain):
+    profile_data = []
+    p2p_matrix = pd.DataFrame(0.0, index=[f"Home_{i}" for i in range(1, 11)], columns=[f"Home_{i}" for i in range(1, 11)])
+    consumer_payments, prosumer_earnings = defaultdict(float), defaultdict(float)
+    market_chain = blockchain_class() if use_blockchain else []
+    total_battery_storage_per_hour = []
+    batteries = {f"Home_{i}": 0.0 for i in range(1, 11)}
+
+    def match_market(prosumers, consumers):
+        transactions = []
+        GRID_IMPORT_PRICE, GRID_EXPORT_PRICE = 12.0, 2.0
+        adjusted_prosumers = [p for p in prosumers if p.energy_available > 0.001]
+        adjusted_consumers = [c for c in consumers if c.energy_required > 0.001]
+        if adjusted_prosumers and adjusted_consumers:
+            sellers = [(i, p.name, p.energy_available, p.price_per_unit) for i, p in enumerate(adjusted_prosumers)]
+            buyers = [(j, c.name, c.energy_required, c.bid_price) for j, c in enumerate(adjusted_consumers)]
+            num_sellers, num_buyers = len(sellers), len(buyers)
+            cost_matrix = np.zeros((num_sellers, num_buyers))
+            for i, (_, _, _, s_price) in enumerate(sellers):
+                for j, (_, _, _, b_price) in enumerate(buyers):
+                    if b_price >= s_price: cost_matrix[i, j] = -(b_price - s_price)
+            c = cost_matrix.flatten()
+            A_ub_s = np.kron(np.eye(num_sellers), np.ones(num_buyers)); b_ub_s = [s[2] for s in sellers]
+            A_ub_d = np.kron(np.ones((1, num_sellers)), np.eye(num_buyers)); b_ub_d = [b[2] for b in buyers]
+            res = linprog(c, A_ub=np.vstack([A_ub_s, A_ub_d]), b_ub=np.hstack([b_ub_s, b_ub_d]), bounds=(0, None), method='highs')
+            if res.success:
+                solution = res.x.reshape((num_sellers, num_buyers))
+                for i in range(num_sellers):
+                    for j in range(num_buyers):
+                        if solution[i, j] > 0.001:
+                            s, b = sellers[i], buyers[j]
+                            energy, price = solution[i, j], (s[3] + b[3]) / 2
+                            amount = energy * price
+                            transactions.append({'from': s[1], 'to': b[1], 'energy_kWh': energy, 'price_per_kWh': price, 'total_amount': amount})
+                            consumer_payments[b[1]] += amount; prosumer_earnings[s[1]] += amount
+                            adjusted_prosumers[i].energy_available -= energy; adjusted_consumers[j].energy_required -= energy
+        
+        total_supply = sum(p.energy_available for p in adjusted_prosumers)
+        total_demand = sum(c.energy_required for c in adjusted_consumers)
+
+        if total_demand > 0.001:
+            amount = total_demand * GRID_IMPORT_PRICE
+            transactions.append({'from': 'Grid', 'to': 'System', 'energy_kWh': total_demand, 'price_per_kWh': GRID_IMPORT_PRICE, 'total_amount': amount})
+            for c in adjusted_consumers:
+                if c.energy_required > 0: consumer_payments[c.name] += (c.energy_required / total_demand) * amount
+        if total_supply > 0.001:
+            amount = total_supply * GRID_EXPORT_PRICE
+            transactions.append({'from': 'System', 'to': 'Grid', 'energy_kWh': total_supply, 'price_per_kWh': GRID_EXPORT_PRICE, 'total_amount': amount})
+            for p in adjusted_prosumers:
+                if p.energy_available > 0: prosumer_earnings[p.name] += (p.energy_available / total_supply) * amount
+        
+        # *** CHANGE: Return the state of participants after the market runs ***
+        return transactions, adjusted_prosumers, adjusted_consumers
+
+    for hour, hour_profiles in enumerate(shared_profiles):
+        prosumers, consumers = [], []
+        total_gen_this_hour, total_potential_load_this_hour = 0, 0
+        total_trade_gen_for_hour, total_trade_load_for_hour = 0, 0
+
+        # --- PRE-MARKET PHASE: Determine surplus/deficit for each home ---
+        for profile in hour_profiles:
+            name, gen = profile['name'], profile['gen']
+            total_gen_this_hour += gen
+            
+            available_power = gen
+            potential_load = sum(app['power_kW'] for app in profile['appliances'])
+            total_potential_load_this_hour += potential_load
+            
+            appliances_sorted = sorted(profile['appliances'], key=lambda x: x['priority'])
+            actual_load_met_by_solar = 0
+            unpowered_load = 0
+            
+            for app in appliances_sorted:
+                if available_power >= app['power_kW']:
+                    available_power -= app['power_kW']
+                    actual_load_met_by_solar += app['power_kW']
+                else:
+                    unpowered_load += app['power_kW']
+            
+            energy_surplus = available_power
+            energy_deficit = unpowered_load
+            
+            energy_for_trade = 0
+            energy_to_req = 0
+
+            if energy_surplus > 0:
+                energy_for_trade = energy_surplus
+            
+            if energy_deficit > 0:
+                from_battery = min(energy_deficit, batteries[name])
+                batteries[name] -= from_battery
+                energy_to_req = energy_deficit - from_battery
+            
+            total_trade_gen_for_hour += energy_for_trade
+            total_trade_load_for_hour += energy_to_req
+
+            prosumer_price = max(4.0, min(6.5, (time_strategy(hour) if strategy_type == 'time' else inventory_strategy(energy_for_trade)) + profile['price_offset']))
+            consumer_bid = max(4.5, min(11.5, consumer_bid_strategy(strategy_type, hour, gen, potential_load)))
+            prosumers.append(Prosumer(f"{name}_PV", energy_for_trade, prosumer_price))
+            consumers.append(Consumer(name, energy_to_req, consumer_bid))
+        
+        # Log battery state BEFORE post-market charging
+        total_battery_storage_per_hour.append(sum(batteries.values()))
+        profile_data.append({
+            "Hour": f"{hour}:00", "Total_Gen_kWh": total_gen_this_hour, 
+            "Total_Potential_Load_kWh": total_potential_load_this_hour,
+            "Total_Trades_Gen_kWh": total_trade_gen_for_hour, 
+            "Total_Trades_Load_kWh": total_trade_load_for_hour
+        })
+
+        # --- MARKET PHASE: Match buyers and sellers ---
+        transactions, prosumers_after_market, consumers_after_market = match_market(prosumers, consumers)
+        
+        # --- POST-MARKET PHASE: Handle battery charging with unsold energy ---
+        prosumer_results = {p.name.replace("_PV", ""): p.energy_available for p in prosumers_after_market}
+        for p in prosumers:
+            home_name = p.name.replace("_PV", "")
+            unsold_surplus = prosumer_results.get(home_name, 0)
+            if unsold_surplus > 0.001:
+                profile = next(prof for prof in hour_profiles if prof['name'] == home_name)
+                can_store = profile['battery_capacity'] - batteries[home_name]
+                amount_to_store = min(unsold_surplus, can_store)
+                if amount_to_store > 0:
+                    batteries[home_name] += amount_to_store
+
+        if transactions:
+            if use_blockchain: market_chain.add_block(transactions)
+            else: market_chain.append(transactions)
+        
+        for tx in transactions:
+            if "Home" in tx['from'] and "Home" in tx['to']:
+                p2p_matrix.loc[tx['from'].replace("_PV", ""), tx['to']] += tx['energy_kWh']
+
+    df = pd.DataFrame(profile_data)
+    grid_import, grid_export, p2p_trades = defaultdict(float), defaultdict(float), defaultdict(float)
+    chain_source = market_chain.chain[1:] if use_blockchain else market_chain
+    for i, item in enumerate(chain_source):
+        hour_str = f"{i}:00"
+        txs = item.transactions if use_blockchain else item
+        for tx in txs:
+            if tx['from'] == 'Grid': grid_import[hour_str] += tx['energy_kWh']
+            if tx['to'] == 'Grid': grid_export[hour_str] += tx['energy_kWh']
+            if "Home" in tx['from'] and "Home" in tx['to']: p2p_trades[hour_str] += tx['energy_kWh']
+
+    df["Grid_Import_kWh"] = [grid_import.get(h, 0) for h in df["Hour"]]
+    df["Grid_Export_kWh"] = [grid_export.get(h, 0) for h in df["Hour"]]
+    df["P2P_Trades_kWh"] = [p2p_trades.get(h, 0) for h in df["Hour"]]
+    df["Net_Balance"] = (df["Total_Trades_Gen_kWh"] + df["Grid_Import_kWh"] - df["Total_Trades_Load_kWh"] - df["Grid_Export_kWh"]).round(6)
+    return df, market_chain, consumer_payments, prosumer_earnings, p2p_matrix, total_battery_storage_per_hour
+
+# --- Simulation Setup with Appliance Modeling ---
+def solar_generation(hour):
+    if 6 <= hour <= 18: return round(max(0, math.sin(math.pi * (hour-6)/12)) * 1.2 * 12.63 * 0.165, 2)
+    return 0
+
+def create_household_appliances(total_potential_load, hour):
+    appliances = [{'name': 'Fridge & Base', 'power_kW': 0.15, 'priority': 1}]
+    if 18 <= hour <= 23 or 6 <= hour <= 9:
+        appliances.append({'name': 'Lighting', 'power_kW': 0.2, 'priority': 1})
+    remaining_load = total_potential_load - sum(a['power_kW'] for a in appliances)
+    if remaining_load > 0:
+        if 16 <= hour <= 22:
+            ac_load = min(remaining_load, 1.5)
+            appliances.append({'name': 'Air Conditioner', 'power_kW': ac_load, 'priority': 2})
+            remaining_load -= ac_load
+        if remaining_load > 0.01:
+            appliances.append({'name': 'General Use', 'power_kW': remaining_load, 'priority': 2})
+    return appliances
+
+shared_profiles_per_home = []
+base_load_profile = [random.uniform(0.5, 1.5) for _ in range(24)]
+battery_caps = [8.0, 10.0, 6.0, 12.0, 9.0, 7.5, 11.0, 9.5, 10.5, 8.5]
+for hour, base_factor in enumerate(base_load_profile):
+    hour_profiles = []
+    for i in range(1, 11):
+        potential_load = round(base_factor * (1 + (i-5)*0.1), 2)
+        hour_profiles.append({
+            'name': f"Home_{i}", 'appliances': create_household_appliances(potential_load, hour),
+            'gen': solar_generation(hour) * (1 + (i-5)*0.05),
+            'price_offset': random.uniform(-0.3, 0.3), 'battery_capacity': battery_caps[i-1]
+        })
+    shared_profiles_per_home.append(hour_profiles)
+
+# --- Simulation Execution & Analysis ---
+comparison_data_all = []
+no_blockchain_results, blockchain_results = {}, []
+blockchain_variants = {
+    "Default": Blockchain, "Simple": SimpleBlockchain,
+    "HashIndexed": HashIndexedBlockchain, "Verified": VerifiedBlockchain
+}
+
+# Run No Blockchain cases
+for strategy in ['time', 'inventory']:
+    label = f"{strategy.title()} + No Blockchain"
+    print(f"=== Running: {label} ===")
+    df, _, payments, earnings, p2p, battery = simulate_market(strategy, False, shared_profiles_per_home)
+    total_payments, total_earnings = sum(payments.values()), sum(earnings.values())
+    result = {'Strategy': label, 'Total Generation': df['Total_Gen_kWh'].sum(), 'Total Potential Load': df['Total_Potential_Load_kWh'].sum(),
+              'Grid Import': df['Grid_Import_kWh'].sum(), 'Grid Export': df['Grid_Export_kWh'].sum(), 'P2P Trades': df['P2P_Trades_kWh'].sum(),
+              'Final Net Balance': df['Net_Balance'].sum(), 'Total Consumer Payments': total_payments, 'Total Prosumer Earnings': total_earnings,
+              'Net System Cost': total_payments - total_earnings, 'Avg Battery Storage': sum(battery)/len(battery)}
+    no_blockchain_results[strategy.title()] = result
+    comparison_data_all.append(result)
+
+# Run Blockchain cases
+for strategy in ['time', 'inventory']:
+    for name, variant_class in blockchain_variants.items():
+        label = f"{strategy.title()} + {name} Blockchain"
+        print(f"=== Running: {label} ===")
+        df, _, payments, earnings, p2p, battery = simulate_market(strategy, True, shared_profiles_per_home, blockchain_class=variant_class)
+        total_payments, total_earnings = sum(payments.values()), sum(earnings.values())
+        result = {'Strategy': label, 'Total Generation': df['Total_Gen_kWh'].sum(), 'Total Potential Load': df['Total_Potential_Load_kWh'].sum(),
+                  'Grid Import': df['Grid_Import_kWh'].sum(), 'Grid Export': df['Grid_Export_kWh'].sum(), 'P2P Trades': df['P2P_Trades_kWh'].sum(),
+                  'Final Net Balance': df['Net_Balance'].sum(), 'Total Consumer Payments': total_payments, 'Total Prosumer Earnings': total_earnings,
+                  'Net System Cost': total_payments - total_earnings, 'Avg Battery Storage': sum(battery)/len(battery)}
+        blockchain_results.append(result)
+        comparison_data_all.append(result)
+
+# Print Final Summary Tables
+print("\n=== HEMS-Managed Energy Market Simulation Results ===")
+comparison_df = pd.DataFrame(comparison_data_all)
+print(comparison_df.round(2).to_string(index=False))
+
+print("\n=== Blockchain Benefit Analysis ===")
+print("| Strategy                   | Metric               | With Blockchain | No Blockchain | Difference | Benefit   |")
+print("|----------------------------|----------------------|-----------------|---------------|------------|-----------|")
+for blk_run in blockchain_results:
+    strategy_key, variant_name = blk_run['Strategy'].split(' + ')[0], blk_run['Strategy'].split(' + ')[1]
+    no_blk_run = no_blockchain_results[strategy_key]
+    strat_label = f"{strategy_key} + {variant_name}"
+    def get_benefit(metric, blk_val, no_blk_val):
+        diff = blk_val - no_blk_val
+        if abs(diff) < 1e-6: return diff, "Equal"
+        if metric == "Final Net Balance": return diff, "Better" if abs(blk_val) < abs(no_blk_val) else "Worse"
+        better_if_positive = metric in ["P2P Trades", "Grid Export"]
+        if (diff > 0 and better_if_positive) or (diff < 0 and not better_if_positive): return diff, "Better"
+        return diff, "Worse"
+    for metric in ["P2P Trades", "Grid Import", "Grid Export", "Final Net Balance", "Net System Cost"]:
+        blk_val, no_blk_val = blk_run[metric], no_blk_run[metric]
+        diff, benefit = get_benefit(metric, blk_val, no_blk_val)
+        print(f"| {strat_label:<26} | {metric:<20} | {blk_val:>15.2f} | {no_blk_val:>13.2f} | {diff:>10.2f} | {benefit:<9} |")
